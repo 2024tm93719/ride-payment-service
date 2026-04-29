@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.responses import Response
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, String
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, Integer, Float, String, select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
 import uuid
 import logging
 from pythonjsonlogger import jsonlogger
@@ -10,10 +11,10 @@ from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI(title="Payment Service")
 
-DATABASE_URL = "sqlite:///./payment_service.db"
+DATABASE_URL = "sqlite+aiosqlite:///./payment_service.db"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
+engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 payments_failed_total = Counter(
@@ -52,7 +53,19 @@ class PaymentRequest(BaseModel):
     payment_method: str = "CARD"
 
 
-Base.metadata.create_all(bind=engine)
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
+
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
 
 
 def get_correlation_id(request: Request):
@@ -70,7 +83,7 @@ def metrics():
 
 
 @app.get("/v1/payments")
-def get_payments(request: Request):
+async def get_payments(request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
     logger.info(
@@ -78,17 +91,16 @@ def get_payments(request: Request):
         extra={"correlation_id": correlation_id}
     )
 
-    db = SessionLocal()
-    payments = db.query(Payment).all()
-    db.close()
-    return payments
+    result = await db.execute(select(Payment))
+    return result.scalars().all()
 
 
 @app.post("/v1/payments/charge")
-def charge_payment(
+async def charge_payment(
     request_data: PaymentRequest,
     request: Request,
-    idempotency_key: str = Header(None)
+    idempotency_key: str = Header(None),
+    db: AsyncSession = Depends(get_db)
 ):
     correlation_id = get_correlation_id(request)
 
@@ -110,15 +122,12 @@ def charge_payment(
             detail="Idempotency-Key header is required"
         )
 
-    db = SessionLocal()
-
-    existing_payment = db.query(Payment).filter(
-        Payment.idempotency_key == idempotency_key
-    ).first()
+    result = await db.execute(
+        select(Payment).filter(Payment.idempotency_key == idempotency_key)
+    )
+    existing_payment = result.scalars().first()
 
     if existing_payment:
-        db.close()
-
         logger.info(
             "Duplicate payment request avoided",
             extra={"correlation_id": correlation_id}
@@ -140,9 +149,8 @@ def charge_payment(
     )
 
     db.add(payment)
-    db.commit()
-    db.refresh(payment)
-    db.close()
+    await db.commit()
+    await db.refresh(payment)
 
     logger.info(
         "Payment processed successfully",
@@ -157,27 +165,23 @@ def charge_payment(
 
 
 @app.post("/v1/payments/{payment_id}/refund")
-def refund_payment(payment_id: int, request: Request):
+async def refund_payment(payment_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     correlation_id = get_correlation_id(request)
 
-    db = SessionLocal()
-    payment = db.query(Payment).filter(Payment.id == payment_id).first()
+    result = await db.execute(select(Payment).filter(Payment.id == payment_id))
+    payment = result.scalars().first()
 
     if not payment:
-        db.close()
-
         logger.error(
             f"Payment {payment_id} not found",
             extra={"correlation_id": correlation_id}
         )
-
         raise HTTPException(status_code=404, detail="Payment not found")
 
     payment.status = "REFUNDED"
 
-    db.commit()
-    db.refresh(payment)
-    db.close()
+    await db.commit()
+    await db.refresh(payment)
 
     logger.info(
         f"Payment {payment_id} refunded successfully",
